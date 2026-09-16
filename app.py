@@ -1,5 +1,7 @@
 """EL AL CRM — מערכת לסוכני נסיעות. הרצה: streamlit run app.py"""
+import random
 import sqlite3
+import string
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +17,14 @@ STATUS_HE = {
     "Scheduled": "🟢 מתוכננת", "Boarding": "🟢 עלייה למטוס", "Delayed": "🟡 מעוכבת",
     "Departed": "🔵 בטיסה", "Landed": "⚪ נחתה", "Cancelled": "🔴 מבוטלת",
 }
+BOOKING_HE = {
+    "Confirmed": "✅ מאושרת", "CheckedIn": "🛄 צ'ק-אין בוצע", "Completed": "⚪ הושלמה",
+    "Cancelled": "🔴 מבוטלת", "NoShow": "⛔ לא הופיע",
+}
+TIER_HE = {
+    "Basic": "Basic", "Silver": "🥈 Silver", "Gold": "🥇 Gold",
+    "Platinum": "💎 Platinum", "Top Platinum": "👑 Top Platinum",
+}
 
 st.set_page_config(page_title="EL AL CRM", page_icon="✈️", layout="wide")
 st.markdown("""<style>
@@ -27,6 +37,20 @@ st.markdown("""<style>
 def q(sql, params=()):
     with sqlite3.connect(DB) as conn:
         return pd.read_sql_query(sql, conn, params=params)
+
+
+def write(sql, params=()):
+    """כתיבה ל-DB. מנקה את ה-cache כדי שהמסכים יציגו את המצב החדש."""
+    with sqlite3.connect(DB) as conn:
+        conn.execute(sql, params)
+        conn.commit()
+    st.cache_data.clear()
+
+
+def scalar(sql, params=()):
+    with sqlite3.connect(DB) as conn:
+        row = conn.execute(sql, params).fetchone()
+    return row[0] if row else None
 
 
 def shekel(x):
@@ -45,6 +69,7 @@ def shekel_short(x):
 FLIGHTS_SQL = """
 SELECT f.flight_id, f.flight_number, f.origin, f.destination,
        f.departure_time, f.arrival_time, f.aircraft_type, f.gate, f.status,
+       f.seats_business, f.seats_economy, f.price_business, f.price_economy,
        f.seats_business + f.seats_economy          AS capacity,
        COUNT(b.booking_id)                         AS booked,
        COALESCE(SUM(b.price_paid), 0)              AS revenue
@@ -60,6 +85,57 @@ def load_flights():
     df["arrival_time"] = pd.to_datetime(df["arrival_time"])
     df["occupancy"] = (df["booked"] / df["capacity"]).clip(upper=1.0)
     return df
+
+
+# ── פעולות על הזמנות ────────────────────────────────────────────────
+PNR_CHARS = string.ascii_uppercase + string.digits
+
+
+def new_pnr():
+    while True:
+        pnr = "".join(random.choice(PNR_CHARS) for _ in range(6))
+        if scalar("SELECT 1 FROM bookings WHERE pnr = ?", (pnr,)) is None:
+            return pnr
+
+
+def free_seat(flight_id, cabin, flight):
+    """המושב הפנוי הראשון בתא המבוקש, או None אם התא מלא."""
+    taken = set(q("SELECT seat FROM bookings WHERE flight_id = ? AND status <> 'Cancelled'",
+                  (int(flight_id),))["seat"].dropna())
+    if cabin == "Business":
+        letters, rows = "ABCD", range(1, int(flight["seats_business"]) // 4 + 3)
+    else:
+        letters, rows = "ABCDEF", range(10, 10 + int(flight["seats_economy"]) // 6 + 3)
+    for r in rows:
+        for letter in letters:
+            if f"{r}{letter}" not in taken:
+                return f"{r}{letter}"
+    return None
+
+
+def seats_left(flight_id, cabin, flight):
+    capacity = int(flight["seats_business"] if cabin == "Business" else flight["seats_economy"])
+    used = scalar("SELECT COUNT(*) FROM bookings WHERE flight_id = ? AND cabin_class = ?"
+                  " AND status <> 'Cancelled'", (int(flight_id), cabin)) or 0
+    return capacity - used
+
+
+def create_booking(customer_id, flight, cabin, baggage, notes):
+    seat = free_seat(flight["flight_id"], cabin, flight)
+    if seat is None:
+        return None, "אין מושבים פנויים בתא זה."
+    price = float(flight["price_business"] if cabin == "Business" else flight["price_economy"])
+    pnr = new_pnr()
+    write("""INSERT INTO bookings (pnr, customer_id, flight_id, booking_date, cabin_class,
+                                   seat, baggage_count, price_paid, status, agent_notes)
+             VALUES (?,?,?,?,?,?,?,?,'Confirmed',?)""",
+          (pnr, int(customer_id), int(flight["flight_id"]), NOW.isoformat(sep=" "),
+           cabin, seat, int(baggage), price, notes or None))
+    return pnr, seat
+
+
+def set_booking_status(booking_id, status):
+    write("UPDATE bookings SET status = ? WHERE booking_id = ?", (status, int(booking_id)))
 
 
 def style_fig(fig, height=320):
@@ -197,7 +273,199 @@ def page_flights(fl):
     m[3].metric("תפוסה", f"{f['occupancy']:.0%}")
     m[3].caption(f"{f['booked']} מתוך {f['capacity']} מושבים")
     m[4].metric("הכנסות", shekel(f["revenue"]))
-    st.info("רשימת הנוסעים וניהול ההזמנות יתווספו ב־Phase 3.")
+
+    st.markdown("##### 👥 רשימת נוסעים")
+    pax = q("""SELECT b.pnr, c.first_name || ' ' || c.last_name AS name, c.passport,
+                      c.matmid_tier, b.cabin_class, b.seat, b.baggage_count, b.status
+               FROM bookings b JOIN customers c ON c.customer_id = b.customer_id
+               WHERE b.flight_id = ?
+               ORDER BY CASE b.cabin_class WHEN 'Business' THEN 0 ELSE 1 END, b.seat""",
+            (int(f["flight_id"]),))
+
+    name_filter = st.text_input("סינון לפי שם או דרכון", key="pax_filter", placeholder="כהן")
+    if name_filter:
+        needle = name_filter.strip()
+        pax = pax[pax["name"].str.contains(needle, na=False) |
+                  pax["passport"].str.contains(needle, na=False)]
+
+    live = pax[pax["status"] != "Cancelled"]
+    st.caption(f"{len(live):,} נוסעים · "
+               f"{int((live['status'] == 'CheckedIn').sum()):,} עברו צ'ק-אין · "
+               f"{int((live['cabin_class'] == 'Business').sum()):,} במחלקת עסקים · "
+               f"{int((pax['status'] == 'Cancelled').sum()):,} ביטולים")
+
+    show = pax.assign(cabin=pax["cabin_class"].map({"Business": "עסקים", "Economy": "תיירים"}),
+                      tier=pax["matmid_tier"].map(TIER_HE),
+                      status_he=pax["status"].map(BOOKING_HE))[
+        ["pnr", "name", "passport", "tier", "cabin", "seat", "baggage_count", "status_he"]]
+    show.columns = ["PNR", "שם", "דרכון", "מועדון", "מחלקה", "מושב", "כבודה", "סטטוס"]
+    st.dataframe(show, hide_index=True, width="stretch", height=300)
+
+
+# ── עמוד: לקוחות והזמנות ────────────────────────────────────────────
+SEARCH_SQL = """
+SELECT DISTINCT c.customer_id, c.first_name, c.last_name, c.email, c.phone,
+       c.passport, c.country, c.matmid_tier, c.matmid_points
+FROM customers c LEFT JOIN bookings b ON b.customer_id = c.customer_id
+WHERE c.first_name || ' ' || c.last_name LIKE ?
+   OR c.email LIKE ? OR c.passport LIKE ? OR b.pnr LIKE ?
+ORDER BY c.last_name, c.first_name
+LIMIT 50
+"""
+
+
+def flash(msg, kind="success"):
+    st.session_state["flash"] = (kind, msg)
+    st.rerun()
+
+
+def show_flash():
+    if "flash" in st.session_state:
+        kind, msg = st.session_state.pop("flash")
+        {"success": st.success, "warning": st.warning, "error": st.error}[kind](msg)
+
+
+def page_customers(fl):
+    st.title("👤 לקוחות והזמנות")
+    show_flash()
+
+    term = st.text_input("חיפוש לפי שם, אימייל, דרכון או PNR",
+                         placeholder="כהן · user42@gmail.com · 12345678 · AB12CD")
+    if not term.strip():
+        st.caption("הקלד כדי לחפש לקוח.")
+        return
+
+    like = f"%{term.strip()}%"
+    results = q(SEARCH_SQL, (like, like, like, like))
+    if results.empty:
+        st.warning("לא נמצא לקוח תואם.")
+        return
+
+    st.caption(f"{len(results)} תוצאות" + (" (50 הראשונות)" if len(results) == 50 else ""))
+    listing = results.assign(name=results["first_name"] + " " + results["last_name"],
+                             tier=results["matmid_tier"].map(TIER_HE))[
+        ["name", "passport", "email", "phone", "country", "tier", "matmid_points"]]
+    listing.columns = ["שם", "דרכון", "אימייל", "טלפון", "מדינה", "מועדון", "נקודות"]
+    picked = st.dataframe(listing, hide_index=True, width="stretch", height=200,
+                          on_select="rerun", selection_mode="single-row")
+
+    rows = picked.selection["rows"]
+    if not rows:
+        st.caption("בחר לקוח מהרשימה.")
+        return
+    customer_card(results.iloc[rows[0]], fl)
+
+
+def customer_card(cust, fl):
+    cid = int(cust["customer_id"])
+    st.divider()
+    st.subheader(f"{cust['first_name']} {cust['last_name']}")
+    st.caption(f"דרכון {cust['passport']} · {cust['phone']} · {cust['email']} · {cust['country']}")
+
+    hist = q("""SELECT b.booking_id, b.pnr, f.flight_number, f.origin, f.destination,
+                       f.departure_time, b.cabin_class, b.seat, b.baggage_count,
+                       b.price_paid, b.status, b.agent_notes
+                FROM bookings b JOIN flights f ON f.flight_id = b.flight_id
+                WHERE b.customer_id = ?
+                ORDER BY f.departure_time DESC""", (cid,))
+    hist["departure_time"] = pd.to_datetime(hist["departure_time"])
+    active = hist[hist["status"] != "Cancelled"]
+    upcoming = active[active["departure_time"] >= NOW]
+
+    k = st.columns(4)
+    k[0].metric("מועדון", TIER_HE[cust["matmid_tier"]])
+    k[1].metric("נקודות", f"{int(cust['matmid_points']):,}")
+    k[2].metric("סה\"כ טיסות", len(active))
+    k[3].metric("סה\"כ הוצאה", shekel(active["price_paid"].sum()))
+
+    tab_hist, tab_new = st.tabs([f"🎫 הזמנות ({len(hist)})", "➕ הזמנה חדשה"])
+    with tab_hist:
+        booking_history(hist, upcoming)
+    with tab_new:
+        new_booking_form(cid, fl)
+
+
+def booking_history(hist, upcoming):
+    st.caption(f"{len(upcoming)} טיסות עתידיות")
+    view = hist.assign(route=hist["origin"] + " → " + hist["destination"],
+                       cabin=hist["cabin_class"].map({"Business": "עסקים", "Economy": "תיירים"}),
+                       status_he=hist["status"].map(BOOKING_HE),
+                       notes=hist["agent_notes"].fillna(""))[
+        ["pnr", "flight_number", "route", "departure_time", "cabin", "seat",
+         "baggage_count", "price_paid", "status_he", "notes"]]
+    view.columns = ["PNR", "טיסה", "מסלול", "המראה", "מחלקה", "מושב",
+                    "כבודה", "מחיר", "סטטוס", "הערות"]
+
+    picked = st.dataframe(view, hide_index=True, width="stretch", height=280,
+                          on_select="rerun", selection_mode="single-row",
+                          column_config={
+                              "המראה": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm"),
+                              "מחיר": st.column_config.NumberColumn(format="₪%d")})
+
+    rows = picked.selection["rows"]
+    if not rows:
+        st.caption("בחר הזמנה כדי לבצע עליה פעולה.")
+        return
+
+    b = hist.iloc[rows[0]]
+    st.markdown(f"**{b['pnr']}** · טיסה {b['flight_number']} · "
+                f"{b['origin']} → {b['destination']} · {b['departure_time']:%d/%m/%Y %H:%M}")
+
+    past = b["departure_time"] < NOW
+    can_checkin = b["status"] == "Confirmed" and not past
+    can_cancel = b["status"] in ("Confirmed", "CheckedIn") and not past
+
+    c1, c2, _ = st.columns([1, 1, 3])
+    if c1.button("🛄 בצע צ'ק-אין", disabled=not can_checkin, width="stretch"):
+        set_booking_status(b["booking_id"], "CheckedIn")
+        flash(f"בוצע צ'ק-אין להזמנה {b['pnr']} · מושב {b['seat']}.")
+    if c2.button("🔴 בטל הזמנה", disabled=not can_cancel, width="stretch"):
+        set_booking_status(b["booking_id"], "Cancelled")
+        flash(f"הזמנה {b['pnr']} בוטלה. המושב {b['seat']} שוחרר.", "warning")
+
+    if past:
+        st.caption("הטיסה כבר יצאה — לא ניתן לשנות את ההזמנה.")
+    elif b["status"] == "Cancelled":
+        st.caption("ההזמנה מבוטלת.")
+
+
+def new_booking_form(cid, fl):
+    available = fl[(fl["departure_time"] >= NOW) & (fl["status"] != "Cancelled")]
+    if available.empty:
+        st.warning("אין טיסות עתידיות זמינות.")
+        return
+
+    c1, c2 = st.columns(2)
+    dest = c1.selectbox("יעד", sorted(available["destination"].unique()))
+    cabin = c2.radio("מחלקה", ["Economy", "Business"],
+                     format_func=lambda x: "תיירים" if x == "Economy" else "עסקים",
+                     horizontal=True)
+
+    options = available[available["destination"] == dest].sort_values("departure_time")
+    labels = {int(r.flight_id): f"{r.flight_number} · {r.origin} → {r.destination} · "
+                                f"{r.departure_time:%d/%m/%Y %H:%M}"
+              for r in options.itertuples()}
+    flight_id = st.selectbox("טיסה", list(labels), format_func=lambda i: labels[i])
+    flight = options[options["flight_id"] == flight_id].iloc[0]
+
+    left = seats_left(flight_id, cabin, flight)
+    price = float(flight["price_business"] if cabin == "Business" else flight["price_economy"])
+    i1, i2 = st.columns(2)
+    i1.metric("מושבים פנויים במחלקה", left)
+    i2.metric("מחיר", shekel(price))
+
+    baggage = st.number_input("מזוודות", min_value=0, max_value=3, value=1)
+    notes = st.text_input("הערות סוכן", placeholder="ארוחה כשרה, כיסא גלגלים…")
+
+    if st.button("✅ צור הזמנה", type="primary", disabled=left <= 0):
+        pnr, seat = create_booking(cid, flight, cabin, baggage, notes)
+        if pnr is None:
+            st.error(seat)
+        else:
+            flash(f"נוצרה הזמנה **{pnr}** · טיסה {flight['flight_number']} · מושב {seat} · "
+                  f"{shekel(price)}.")
+    if left <= 0:
+        st.warning("המחלקה מלאה. בחר מחלקה או טיסה אחרת.")
 
 
 # ── ניווט ───────────────────────────────────────────────────────────
@@ -207,11 +475,14 @@ if not DB.exists():
 
 flights = load_flights()
 st.sidebar.title("✈️ EL AL CRM")
-page = st.sidebar.radio("ניווט", ["📊 דשבורד", "🛫 לוח טיסות"], label_visibility="collapsed")
+page = st.sidebar.radio("ניווט", ["📊 דשבורד", "🛫 לוח טיסות", "👤 לקוחות והזמנות"],
+                        label_visibility="collapsed")
 st.sidebar.divider()
 st.sidebar.caption("נתונים סינטטיים להדגמה בלבד.")
 
 if page == "📊 דשבורד":
     page_dashboard(flights)
-else:
+elif page == "🛫 לוח טיסות":
     page_flights(flights)
+else:
+    page_customers(flights)

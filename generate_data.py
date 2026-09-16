@@ -58,6 +58,18 @@ COUNTRIES = ["ישראל"] * 12 + ["ארה\"ב"] * 4 + ["צרפת", "בריטנ�
 TIERS = ["Basic"] * 50 + ["Silver"] * 25 + ["Gold"] * 15 + ["Platinum"] * 8 + ["Top Platinum"] * 2
 
 
+def seat_labels(count, start_row, letters):
+    """תוויות מושב ייחודיות: 1A, 1B, ... כמו במפת המושבים באפליקציה."""
+    labels, row = [], start_row
+    while len(labels) < count:
+        for letter in letters:
+            labels.append(f"{row}{letter}")
+            if len(labels) == count:
+                break
+        row += 1
+    return labels
+
+
 def rand_pnr(used):
     chars = string.ascii_uppercase + string.digits
     while True:
@@ -151,8 +163,9 @@ def make_bookings(customers, flights):
         load = random.uniform(0.55, 0.95)
         n_eco = int(se * load)
         n_biz = int(sb * random.uniform(0.4, 0.95))
-        seat_pool_eco = random.sample(range(10, 10 + se), n_eco)
-        seat_pool_biz = random.sample(range(1, 1 + sb), n_biz)
+        # מושבים ייחודיים לכל תא — בלי הקצאה כפולה
+        seat_pool_biz = random.sample(seat_labels(sb, 1, "ABCD"), n_biz)
+        seat_pool_eco = random.sample(seat_labels(se, 10, "ABCDEF"), n_eco)
 
         for cabin, count, seats, price in (("Business", n_biz, seat_pool_biz, p_biz),
                                            ("Economy", n_eco, seat_pool_eco, p_eco)):
@@ -170,8 +183,7 @@ def make_bookings(customers, flights):
                 else:
                     status = "Confirmed"
 
-                row_num = seats[i] // 6 + 1
-                seat = f"{row_num}{random.choice('ABCDEF')}"
+                seat = seats[i]
                 paid = round(price * random.uniform(0.85, 1.25), 2)
                 bid += 1
                 rows.append((bid, rand_pnr(used_pnr), cid, fid, booked.isoformat(sep=" "),
