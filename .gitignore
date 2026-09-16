@@ -1,0 +1,8 @@
+# מסד הנתונים נוצר מחדש ע"י generate_data.py (seed קבוע)
+*.db
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
